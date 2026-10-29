@@ -5,8 +5,7 @@ set "BOT_PLIK=%~f0"
 powershell -NoProfile -STA -Command "iex ([IO.File]::ReadAllText($env:BOT_PLIK))"
 echo.
 echo  Koniec. To okno zamknie sie za 5 sekund...
-rem TYMCZASOWO: okno zostaje otwarte po zatrzymaniu (oryginal: timeout /t 5 >nul)
-pause
+timeout /t 5 >nul
 exit /b
 #>
 
@@ -14,6 +13,12 @@ exit /b
 
 # Tempo: 0.25 = 2x szybciej, 0,5 = normalnie, 1 = 2x wolniej (dla wolnej VM)
 $Wolno = 0.5
+
+# Automatyczne tempo: bot mierzy, jak dlugo wczytuja sie przegladarka, nowe okna i filmy,
+# i sam dobiera $Wolno (od 0.25 do 1.5; $Wolno powyzej to wartosc bazowa dla "normalnego" komputera).
+# Ustaw $false, zeby uzywac stalego $Wolno.
+$AutoTempo = $true
+$WolnoBazowe = $Wolno
 
 # Ile sekund (razy $Wolno) piosenka gra, zanim bot otworzy kolejne okno
 $CzasGrania = 1
@@ -291,6 +296,44 @@ function Kliknij {
     Czekaj 500
 }
 
+# --- Automatyczne tempo ---
+$script:Wspolczynniki = New-Object 'System.Collections.Generic.List[double]'
+$script:LimitFilm = 12000      # ile ms maksymalnie czekac, az film ruszy sam (potem bot kliknie)
+
+# Zapisuje pomiar (ms) i porownuje go z czasem na szybkim komputerze ($wzorzec, ms).
+# $Wolno = baza * srednia z ostatnich 6 pomiarow, wiec wolny komputer = dluzsze pauzy.
+function Zapisz-Pomiar([string]$co, [double]$ms, [double]$wzorzec) {
+    if (-not $AutoTempo) { return }
+    $script:Wspolczynniki.Add([Math]::Min(4.0, $ms / $wzorzec))
+    $ost = @($script:Wspolczynniki | Select-Object -Last 6)
+    $sr = ($ost | Measure-Object -Average).Average
+    $script:Wolno = [Math]::Min(1.5, [Math]::Max(0.25, $WolnoBazowe * $sr))
+    Write-Host ("    - pomiar ({0}): {1} ms -> tempo {2:N2}" -f $co, [int]$ms, $script:Wolno) -ForegroundColor DarkGray
+}
+
+function Przegladarka-Na-Wierzchu {
+    $h = [Bot.W]::GetForegroundWindow()
+    [uint32]$procId = 0
+    [void][Bot.W]::GetWindowThreadProcessId($h, [ref]$procId)
+    $proc = Get-Process -Id $procId -ErrorAction SilentlyContinue
+    return [bool]($proc -and $proc.ProcessName -eq $Przegladarka.Proc)
+}
+
+# Czeka, az film sam ruszy (obraz sie zmienia) i mierzy, ile to trwalo.
+# Jesli nie ruszy w limicie (np. trzeba kliknac) - wraca, a Wlacz-Film kliknie.
+function Czekaj-Na-Film([int]$x, [int]$y, [int]$w, [int]$h) {
+    $zegar = [Diagnostics.Stopwatch]::StartNew()
+    while ($zegar.ElapsedMilliseconds -lt $script:LimitFilm) {
+        if (Czy-Gra $x $y $w $h) {
+            Zapisz-Pomiar 'film' $zegar.ElapsedMilliseconds 3000
+            $script:LimitFilm = [Math]::Min(12000, [Math]::Max(4000, 2.5 * $zegar.ElapsedMilliseconds))
+            return
+        }
+    }
+    Write-Host '    - film nie ruszyl sam' -ForegroundColor DarkYellow
+    $script:LimitFilm = [Math]::Max(5000, $script:LimitFilm * 0.7)
+}
+
 # Zrzut kawalka ekranu: jasnosc probek co 8 px (do wykrywania, czy obraz sie rusza)
 function Probki([int]$x, [int]$y, [int]$w, [int]$h) {
     $bmp = New-Object System.Drawing.Bitmap $w, $h
@@ -410,14 +453,18 @@ for ($i = 0; $i -lt $Piosenki.Count; $i++) {
     if ($i -eq 0) {
         Write-Host '    - wlaczam przegladarke z YouTube'
         Start-Process -FilePath $Przegladarka.Exe -ArgumentList '--new-window --start-maximized --no-first-run --no-default-browser-check --autoplay-policy=no-user-gesture-required https://www.youtube.com'
-        Czekaj 3000 -Dokladnie                      # 3 s, zeby przegladarka spokojnie wstala
+        $zegarStart = [Diagnostics.Stopwatch]::StartNew()
+        while (-not (Przegladarka-Na-Wierzchu) -and $zegarStart.ElapsedMilliseconds -lt 30000) { Czekaj 100 -Dokladnie }
+        Zapisz-Pomiar 'start przegladarki' $zegarStart.ElapsedMilliseconds 1500
+        Czekaj 6000                                 # ok. 3 s przy tempie 0.5, zeby przegladarka spokojnie wstala
     } else {
         Write-Host '    - Ctrl+N: nowe okno'
         $stare = Aktywuj-Przegladarke
-        Klawisz '^n'
-        # czekaj, az nowe okno naprawde sie pojawi (zeby nie pisac w starym)
-        $zegar = [Diagnostics.Stopwatch]::StartNew()
-        while ([Bot.W]::GetForegroundWindow() -eq $stare -and $zegar.ElapsedMilliseconds -lt 10000) { Czekaj 100 -Dokladnie }
+        $zegarOkna = [Diagnostics.Stopwatch]::StartNew()
+        [System.Windows.Forms.SendKeys]::SendWait('^n')
+        # czekaj, az nowe okno naprawde sie pojawi (zeby nie pisac w starym) i zmierz, ile to trwa
+        while ([Bot.W]::GetForegroundWindow() -eq $stare -and $zegarOkna.ElapsedMilliseconds -lt 10000) { Czekaj 100 -Dokladnie }
+        Zapisz-Pomiar 'nowe okno' $zegarOkna.ElapsedMilliseconds 400
         Czekaj 2000
     }
 
@@ -443,16 +490,20 @@ for ($i = 0; $i -lt $Piosenki.Count; $i++) {
     Klawisz '{ENTER}'
 
     Write-Host '    - czekam, az film sie zaladuje'
-    Czekaj 5000
 
     # srodek odtwarzacza
     $cx = $r.Left + ($r.Right - $r.Left) * 0.35
     $cy = $gora + ($r.Bottom - $gora) * 0.45
 
-    # sprawdz, czy film gra (obszar z lewej strony odtwarzacza, z dala od srodka i paskow sterowania)
+    # obszar do sprawdzania, czy film gra (z lewej strony odtwarzacza, z dala od srodka i paskow sterowania)
     $sx = [int]($r.Left + ($r.Right - $r.Left) * 0.08)
     $sy = [int]($gora + ($r.Bottom - $gora) * 0.30)
-    Wlacz-Film $cx $cy $sx $sy ([int](200 * $skala)) ([int](120 * $skala))
+    $sw = [int](200 * $skala)
+    $sh = [int](120 * $skala)
+
+    # czekaj, az film sam ruszy (mierzy czas wczytywania), a jak nie - kliknij w niego
+    Czekaj-Na-Film $sx $sy $sw $sh
+    Wlacz-Film $cx $cy $sx $sy $sw $sh
 
     # kolko myszka nad filmem
     Mysz-Do ($cx + 80) $cy
