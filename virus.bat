@@ -91,6 +91,9 @@ namespace Bot {
     public static class W {
         [DllImport("user32.dll")] public static extern short  GetAsyncKeyState(int vKey);
         [DllImport("user32.dll")] public static extern bool   SetCursorPos(int x, int y);
+        [DllImport("user32.dll")] public static extern int    GetWindowLong(IntPtr hWnd, int nIndex);
+        [DllImport("user32.dll")] public static extern int    SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong);
+        [DllImport("user32.dll")] public static extern int    GetSystemMetrics(int index);
         [DllImport("user32.dll")] public static extern void   mouse_event(uint flags, int dx, int dy, int data, UIntPtr extra);
         [DllImport("user32.dll")] public static extern void   keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
         [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
@@ -213,18 +216,258 @@ if ([Bot.W]::GetConsoleMode($hIn, [ref]$tryb)) {
     [void][Bot.W]::SetConsoleMode($hIn, ($nowy -bor 0x80))
 }
 
+# MUSI byc wywolane PRZED kazdym GetSystemMetrics/tworzeniem okien (np. przed Start-Pilka nizej) -
+# dopoki proces nie jest DPI-aware, Windows wirtualizuje GetSystemMetrics i zwraca mniejsza,
+# przeskalowana "logiczna" rozdzielczosc zamiast prawdziwej fizycznej, co psuje wszystkie
+# obliczenia oparte na rozmiarze ekranu (granice odbic, rozmiar bitmapy sladu itd.).
+[void][Bot.W]::SetProcessDPIAware()
+
+# ---------------- Odskakujaca "karta" (ozdoba): grawitacja + odbicia jak w animacji -------
+# ---------------- koncowej pasjansa - spada, odbija sie od dolu/gory/bokow, traci troche ---
+# ---------------- energii przy kazdym odbiciu od dolu, a gdy juz ledwo skacze, odrywa sie --
+# ---------------- od nowa. WAZNE (optymalizacja): slad to NIE osobne okno na kazda klatke -
+# ---------------- animacji (to wlasnie zacinalo caly system - tworzenie okna jest ciezkie) -
+# ---------------- - to jeden bitmap rysowany na JEDNEJ przezroczystej planszy na caly ------
+# ---------------- ekran. Realnych okien jest cala zycie skryptu tylko dwa: plansza i karta. -
+# ---------------- Nieklikalne (WS_EX_TRANSPARENT) i bez taskbara, wiec bot to ignoruje. -----
+$GWL_EXSTYLE       = -20
+$WS_EX_TRANSPARENT = 0x00000020
+$WS_EX_TOOLWINDOW  = 0x00000080
+$WS_EX_NOACTIVATE  = 0x08000000
+
+function Ustaw-Nieklikalne($okno) {
+    $styl = [Bot.W]::GetWindowLong($okno.Handle, $GWL_EXSTYLE)
+    [void][Bot.W]::SetWindowLong($okno.Handle, $GWL_EXSTYLE, ($styl -bor $WS_EX_TRANSPARENT -bor $WS_EX_TOOLWINDOW -bor $WS_EX_NOACTIVATE))
+}
+
+function Nowe-Okienko([System.Drawing.Point]$miejsce, [int]$szerokosc, [int]$wysokosc, [System.Drawing.Color]$kolor) {
+    $f = New-Object System.Windows.Forms.Form
+    $f.AutoScaleMode  = [System.Windows.Forms.AutoScaleMode]::None   # bez tego WinForms samo przeskalowuje rozmiar wg DPI
+    $f.FormBorderStyle = 'None'
+    $f.ShowInTaskbar  = $false
+    $f.TopMost        = $true
+    $f.StartPosition  = 'Manual'
+    $f.Width  = $szerokosc
+    $f.Height = $wysokosc
+    $f.BackColor = $kolor
+    $f.Location  = $miejsce
+    $f.Show()
+    Ustaw-Nieklikalne $f
+    return $f
+}
+
+# Wymiary jak u karty do gry (proporcje ~0.7 - szersza plansza wyglada jak odwrocona karta)
+$script:PilkaSzer = 110
+$script:PilkaWys  = 154
+$script:Grawitacja = 0.6     # przyspieszenie w dol - kazda klatka dodaje to do PilkaVy
+$script:Tlumienie  = 0.78    # ile predkosci zostaje po odbiciu od dolu (reszta = strata energii)
+
+$script:PilkaOkno = $null
+$script:PilkaX = 0.0
+$script:PilkaY = 0.0
+$script:PilkaVx = 10.0
+$script:PilkaVy = 0.0
+
+# Plansza sladu: jedno przezroczyste okno na caly ekran + jeden bitmap w pamieci, na ktorym
+# dorysowujemy kolejne "duchy" karty. KluczKolor = kolor uznawany za przezroczysty (TransparencyKey).
+$script:KluczKolor  = [System.Drawing.Color]::FromArgb(255, 1, 2, 3)
+$script:KluczPedzel = $null   # SolidBrush w kolorze "przezroczystosci" - do wymazywania pojedynczych duchow
+$script:Plansza     = $null
+$script:PlanszaBmp  = $null
+$script:PlanszaGfx  = $null
+
+# Kazdy "duch" sladu znika pojedynczo po tylu ms. Kolejka (FIFO) - duchy dodawane sa po kolei,
+# wiec najstarszy zawsze jest na poczatku; wygasle usuwamy TYLKO jego, pojedynczym, malym
+# FillRectangle w jego wlasnym miejscu - bez czyszczenia/przerysowywania calego ekranu
+# (to wlasniezacinalo - pelne Clear() + Invalidate() calej planszy 5x/s to bardzo ciezka operacja).
+$script:SladCzasZycia = 16000
+$script:SladZegar     = $null
+$script:SladElementy  = New-Object 'System.Collections.Generic.Queue[object]'
+
+function Start-Pilka {
+    # GetSystemMetrics = fizyczne piksele Win32 - ta sama przestrzen co SetCursorPos/Location,
+    # w przeciwienstwie do Screen.Bounds (WinForms), ktore przy skalowaniu DPI bywa mniejsze.
+    $szerokoscEkranu = [Bot.W]::GetSystemMetrics(0)   # SM_CXSCREEN
+    $wysokoscEkranu  = [Bot.W]::GetSystemMetrics(1)   # SM_CYSCREEN
+
+    $script:PlanszaBmp  = New-Object System.Drawing.Bitmap $szerokoscEkranu, $wysokoscEkranu
+    $script:PlanszaGfx  = [System.Drawing.Graphics]::FromImage($script:PlanszaBmp)
+    $script:PlanszaGfx.Clear($script:KluczKolor)
+    $script:KluczPedzel = New-Object System.Drawing.SolidBrush $script:KluczKolor
+
+    $script:Plansza = New-Object System.Windows.Forms.Form
+    $script:Plansza.AutoScaleMode  = [System.Windows.Forms.AutoScaleMode]::None   # bez tego WinForms samo przeskalowuje rozmiar wg DPI
+    $script:Plansza.FormBorderStyle = 'None'
+    $script:Plansza.ShowInTaskbar   = $false
+    $script:Plansza.TopMost         = $true
+    $script:Plansza.StartPosition   = 'Manual'
+    $script:Plansza.Location = New-Object System.Drawing.Point(0, 0)
+    $script:Plansza.Width  = $szerokoscEkranu
+    $script:Plansza.Height = $wysokoscEkranu
+    $script:Plansza.BackColor       = $script:KluczKolor
+    $script:Plansza.TransparencyKey = $script:KluczKolor
+    $bmp = $script:PlanszaBmp
+    $script:Plansza.Add_Paint({ param($s, $e) $e.Graphics.DrawImageUnscaled($bmp, 0, 0) }.GetNewClosure())
+    $script:Plansza.Show()
+    Ustaw-Nieklikalne $script:Plansza
+
+    $script:SladZegar = [Diagnostics.Stopwatch]::StartNew()
+    $script:SladElementy.Clear()
+
+    $script:PilkaX = Get-Random -Minimum 0 -Maximum ($szerokoscEkranu - $script:PilkaSzer)
+    $script:PilkaY = Get-Random -Minimum 0 -Maximum ([int](($wysokoscEkranu - $script:PilkaWys) / 2))   # zacznij w gornej polowie, jak wyrzucona karta
+    $script:PilkaVy = -[double](Get-Random -Minimum 20 -Maximum 32)                                      # mocny pierwszy "wyrzut" do gory
+    $miejsce = New-Object System.Drawing.Point([int]$script:PilkaX, [int]$script:PilkaY)
+    $script:PilkaOkno = Nowe-Okienko $miejsce $script:PilkaSzer $script:PilkaWys ([System.Drawing.Color]::White)
+}
+
+# Przesuwa karte o jedna "klatke" animacji (grawitacja + odbicia jak w pasjansie). Slad
+# dorysowuje na istniejacym bitmapie (szybki FillRectangle) - zero nowych okien na klatke.
+function Aktualizuj-Pilke {
+    if (-not $script:PilkaOkno) { return }
+    $maxX = [Bot.W]::GetSystemMetrics(0) - $script:PilkaSzer    # SM_CXSCREEN, fizyczne piksele
+    $maxY = [Bot.W]::GetSystemMetrics(1) - $script:PilkaWys     # SM_CYSCREEN, fizyczne piksele
+
+    $script:PilkaVy += $script:Grawitacja
+    $script:PilkaX  += $script:PilkaVx
+    $script:PilkaY  += $script:PilkaVy
+
+    if ($script:PilkaX -le 0)     { $script:PilkaX = 0;     $script:PilkaVx =  [Math]::Abs($script:PilkaVx) }
+    if ($script:PilkaX -ge $maxX) { $script:PilkaX = $maxX; $script:PilkaVx = -[Math]::Abs($script:PilkaVx) }
+    if ($script:PilkaY -le 0)     { $script:PilkaY = 0;     $script:PilkaVy =  [Math]::Abs($script:PilkaVy) }
+    if ($script:PilkaY -ge $maxY) {
+        $script:PilkaY = $maxY
+        $script:PilkaVy = -[Math]::Abs($script:PilkaVy) * $script:Tlumienie    # odbicie od dolu, troche energii w strate
+        if ([Math]::Abs($script:PilkaVy) -lt 4) {
+            # ledwo juz skacze - mocny nowy "wyrzut", jak kolejna karta rzucona na nowo
+            $script:PilkaVy = -[double](Get-Random -Minimum 24 -Maximum 34)
+            $script:PilkaVx = (Get-Random -Minimum 10 -Maximum 18) * (@(-1, 1) | Get-Random)
+        }
+    }
+
+    # slad: dorysuj "ducha" w starym miejscu, zapamietujac kiedy powstal (zeby pozniej mogl wygasnac)
+    $stareMiejsce = $script:PilkaOkno.Location
+    $teraz = $script:SladZegar.ElapsedMilliseconds
+    $script:SladElementy.Enqueue([PSCustomObject]@{ X = $stareMiejsce.X; Y = $stareMiejsce.Y; Dodany = $teraz })
+    $script:PlanszaGfx.FillRectangle([System.Drawing.Brushes]::Gainsboro, $stareMiejsce.X, $stareMiejsce.Y, $script:PilkaSzer, $script:PilkaWys)
+    $script:Plansza.Invalidate((New-Object System.Drawing.Rectangle $stareMiejsce.X, $stareMiejsce.Y, $script:PilkaSzer, $script:PilkaWys))
+
+    # usun (pojedynczo, bez przebudowy calej planszy) te "duchy", ktore wlasnie wygasly. Kolejka
+    # jest posortowana wg czasu dodania, wiec zawsze sprawdzamy tylko najstarszy element z przodu.
+    while ($script:SladElementy.Count -gt 0 -and ($teraz - $script:SladElementy.Peek().Dodany) -ge $script:SladCzasZycia) {
+        $wygasly = $script:SladElementy.Dequeue()
+        $script:PlanszaGfx.FillRectangle($script:KluczPedzel, $wygasly.X, $wygasly.Y, $script:PilkaSzer, $script:PilkaWys)
+        $script:Plansza.Invalidate((New-Object System.Drawing.Rectangle $wygasly.X, $wygasly.Y, $script:PilkaSzer, $script:PilkaWys))
+    }
+
+    $script:PilkaOkno.Location = New-Object System.Drawing.Point([int]$script:PilkaX, [int]$script:PilkaY)
+    [System.Windows.Forms.Application]::DoEvents()    # bez tego okno/plansza by sie nie przerysowaly (nie ma Application.Run)
+}
+
+function Zamknij-Pilke {
+    if ($script:PilkaOkno)   { $script:PilkaOkno.Close();   $script:PilkaOkno.Dispose();   $script:PilkaOkno   = $null }
+    if ($script:Plansza)     { $script:Plansza.Close();     $script:Plansza.Dispose();     $script:Plansza     = $null }
+    if ($script:PlanszaGfx)  { $script:PlanszaGfx.Dispose(); $script:PlanszaGfx = $null }
+    if ($script:PlanszaBmp)  { $script:PlanszaBmp.Dispose(); $script:PlanszaBmp = $null }
+    if ($script:KluczPedzel) { $script:KluczPedzel.Dispose(); $script:KluczPedzel = $null }
+    $script:SladElementy.Clear()
+}
+
+# ---------------- Losowo pojawiajacy/znikajacy obrazek (miku/teto) ------------------------
+# ---------------- Jeden na raz, w losowym miejscu, na losowy czas - rownolegle do karty. ---
+$script:ObrazkiPliki = @(
+    'C:\Users\PawelPoleszak\Desktop\virus\miku.png'
+    'C:\Users\PawelPoleszak\Desktop\virus\teto.png'
+)
+$script:ObrazekMaxWysokosc  = 800       # skalujemy obrazek w dol do tej wysokosci (px), proporcje zachowane
+$script:ObrazekCzasWidoczny = 900, 1100    # ms - losowy zakres: jak dlugo obrazek jest widoczny (~1 s)
+$script:ObrazekCzasPrzerwy  = 800, 2000    # ms - losowy zakres: przerwa, zanim pojawi sie kolejny
+
+$script:ObrazkiBitmapy  = @()
+$script:ObrazekOkno     = $null
+$script:ObrazekZegar    = $null
+$script:ObrazekNastepna = 0
+$script:ObrazekPokazany = $false
+
+function Start-Obrazki {
+    $script:ObrazkiBitmapy = @()
+    foreach ($plik in $script:ObrazkiPliki) {
+        if (-not (Test-Path $plik)) { Write-Host "  Nie znalazlem obrazka: $plik" -ForegroundColor DarkYellow; continue }
+        try {
+            $oryginal = [System.Drawing.Image]::FromFile($plik)
+            $skala = [Math]::Min(1.0, $script:ObrazekMaxWysokosc / $oryginal.Height)
+            $w = [Math]::Max(1, [int]($oryginal.Width  * $skala))
+            $h = [Math]::Max(1, [int]($oryginal.Height * $skala))
+            $script:ObrazkiBitmapy += New-Object System.Drawing.Bitmap $oryginal, $w, $h
+            $oryginal.Dispose()
+        } catch { Write-Host "  Nie udalo sie wczytac: $plik" -ForegroundColor DarkYellow }
+    }
+    $script:ObrazekZegar    = [Diagnostics.Stopwatch]::StartNew()
+    $script:ObrazekPokazany = $false
+    $script:ObrazekNastepna = Get-Random -Minimum $script:ObrazekCzasPrzerwy[0] -Maximum $script:ObrazekCzasPrzerwy[1]
+}
+
+# Co klatke: albo pokazuje nowy obrazek (gdy minela przerwa), albo chowa pokazany (gdy minal jego czas).
+function Aktualizuj-Obrazki {
+    if ($script:ObrazkiBitmapy.Count -eq 0) { return }
+    $teraz = $script:ObrazekZegar.ElapsedMilliseconds
+
+    if (-not $script:ObrazekPokazany) {
+        if ($teraz -lt $script:ObrazekNastepna) { return }
+        $bmp = $script:ObrazkiBitmapy | Get-Random
+        $szerokoscEkranu = [Bot.W]::GetSystemMetrics(0)   # SM_CXSCREEN, fizyczne piksele
+        $wysokoscEkranu  = [Bot.W]::GetSystemMetrics(1)   # SM_CYSCREEN, fizyczne piksele
+        $x = Get-Random -Minimum 0 -Maximum ([Math]::Max(1, $szerokoscEkranu - $bmp.Width))
+        $y = Get-Random -Minimum 0 -Maximum ([Math]::Max(1, $wysokoscEkranu  - $bmp.Height))
+
+        $script:ObrazekOkno = New-Object System.Windows.Forms.Form
+        $script:ObrazekOkno.AutoScaleMode   = [System.Windows.Forms.AutoScaleMode]::None
+        $script:ObrazekOkno.FormBorderStyle = 'None'
+        $script:ObrazekOkno.ShowInTaskbar   = $false
+        $script:ObrazekOkno.TopMost         = $true
+        $script:ObrazekOkno.StartPosition   = 'Manual'
+        $script:ObrazekOkno.Width  = $bmp.Width
+        $script:ObrazekOkno.Height = $bmp.Height
+        $script:ObrazekOkno.Location = New-Object System.Drawing.Point($x, $y)
+        $script:ObrazekOkno.BackColor       = $script:KluczKolor    # ten sam klucz co plansza -
+        $script:ObrazekOkno.TransparencyKey = $script:KluczKolor    # przezroczyste tlo PNG zostaje przezroczyste
+        $script:ObrazekOkno.BackgroundImage = $bmp
+        $script:ObrazekOkno.BackgroundImageLayout = 'Stretch'
+        $script:ObrazekOkno.Show()
+        Ustaw-Nieklikalne $script:ObrazekOkno
+
+        $script:ObrazekPokazany = $true
+        $script:ObrazekNastepna = $teraz + (Get-Random -Minimum $script:ObrazekCzasWidoczny[0] -Maximum $script:ObrazekCzasWidoczny[1])
+    } else {
+        if ($teraz -lt $script:ObrazekNastepna) { return }
+        $script:ObrazekOkno.Close(); $script:ObrazekOkno.Dispose(); $script:ObrazekOkno = $null
+        $script:ObrazekPokazany = $false
+        $script:ObrazekNastepna = $teraz + (Get-Random -Minimum $script:ObrazekCzasPrzerwy[0] -Maximum $script:ObrazekCzasPrzerwy[1])
+    }
+}
+
+function Zamknij-Obrazki {
+    if ($script:ObrazekOkno) { $script:ObrazekOkno.Close(); $script:ObrazekOkno.Dispose(); $script:ObrazekOkno = $null }
+    foreach ($b in $script:ObrazkiBitmapy) { $b.Dispose() }
+    $script:ObrazkiBitmapy = @()
+}
+
 # NA SAM START: blokada calego inputu poza DELETE (bot dalej steruje mysza i klawiatura).
 # 1. DELETE wycisza dzwiek, 2. DELETE zatrzymuje bota i zdejmuje blokade; sama znika najpozniej po 30 minutach.
 [Bot.Blokada]::Wlacz(1800)
+Start-Pilka
+Start-Obrazki
 
 # Zapamietaj glosnosc z samego poczatku (przywroci ja 1. DELETE)
 $script:GlosnoscStart = [Bot.Glosnosc]::Odczytaj()
 
-# Glosnosc na maksa: 50 x "glosnosc w gore" (kazde to +2%, odcisza tez wyciszony dzwiek)
-for ($v = 0; $v -lt 50; $v++) {
-    [Bot.W]::keybd_event(0xAF, 0, 1, [UIntPtr]::Zero)    # VK_VOLUME_UP wcisnij
-    [Bot.W]::keybd_event(0xAF, 0, 3, [UIntPtr]::Zero)    # VK_VOLUME_UP pusc
-    Start-Sleep -Milliseconds 20
+# Glosnosc na maksa: od razu, jednym wywolaniem (Core Audio) - a nie stopniowo klawiszami
+if (-not [Bot.Glosnosc]::Ustaw(1.0)) {
+    # awaryjnie (gdy Core Audio nie dziala): tak samo jak przy wyciszaniu - bez opoznien miedzy wcisnieciami
+    for ($v = 0; $v -lt 50; $v++) {
+        [Bot.W]::keybd_event(0xAF, 0, 1, [UIntPtr]::Zero)    # VK_VOLUME_UP wcisnij
+        [Bot.W]::keybd_event(0xAF, 0, 3, [UIntPtr]::Zero)    # VK_VOLUME_UP pusc
+    }
 }
 Write-Host '  Glosnosc: 100%'
 Write-Host '  Gotowe do startu.'
@@ -246,8 +489,14 @@ function Sprawdz-Stop {
             }
         }
     }
+
+    Aktualizuj-Pilke
+    Aktualizuj-Obrazki
+
     if ([Bot.Blokada]::Stop) {
         [Bot.Blokada]::Wylacz()
+        Zamknij-Pilke
+        Zamknij-Obrazki
         Write-Host ''
         exit
     }
@@ -266,15 +515,14 @@ function Klawisz([string]$k) {
     Czekaj 300
 }
 
-# Pisanie tekstu litera po literze
+# Pisanie tekstu od razu, calosc jednym wywolaniem (bez odczekiwania miedzy znakami)
 function Pisz([string]$tekst) {
     if ([Console]::CapsLock) { [System.Windows.Forms.SendKeys]::SendWait('{CAPSLOCK}') }  # ID filmu rozroznia wielkie litery
-    foreach ($c in $tekst.ToCharArray()) {
-        $z = [string]$c
-        if ('+^%~(){}[]'.Contains($z)) { $z = '{' + $z + '}' }   # znaki specjalne dla SendKeys
-        [System.Windows.Forms.SendKeys]::SendWait($z)
-        Czekaj 50
-    }
+    $uciekly = -join ($tekst.ToCharArray() | ForEach-Object {
+        $z = [string]$_
+        if ('+^%~(){}[]'.Contains($z)) { '{' + $z + '}' } else { $z }   # znaki specjalne dla SendKeys
+    })
+    [System.Windows.Forms.SendKeys]::SendWait($uciekly)
 }
 
 # Plynny ruch myszki do punktu (x, y)
@@ -308,7 +556,6 @@ function Zapisz-Pomiar([string]$co, [double]$ms, [double]$wzorzec) {
     $ost = @($script:Wspolczynniki | Select-Object -Last 6)
     $sr = ($ost | Measure-Object -Average).Average
     $script:Wolno = [Math]::Min(1.5, [Math]::Max(0.25, $WolnoBazowe * $sr))
-    Write-Host ("    - pomiar ({0}): {1} ms -> tempo {2:N2}" -f $co, [int]$ms, $script:Wolno) -ForegroundColor DarkGray
 }
 
 function Przegladarka-Na-Wierzchu {
@@ -320,7 +567,7 @@ function Przegladarka-Na-Wierzchu {
 }
 
 # Czeka, az film sam ruszy (obraz sie zmienia) i mierzy, ile to trwalo.
-# Jesli nie ruszy w limicie (np. trzeba kliknac) - wraca, a Wlacz-Film kliknie.
+# Jesli nie ruszy w limicie - po prostu wraca (bot nie klika w odtwarzacz).
 function Czekaj-Na-Film([int]$x, [int]$y, [int]$w, [int]$h) {
     $zegar = [Diagnostics.Stopwatch]::StartNew()
     while ($zegar.ElapsedMilliseconds -lt $script:LimitFilm) {
@@ -363,17 +610,6 @@ function Czy-Gra([int]$x, [int]$y, [int]$w, [int]$h) {
     } catch { return $false }
 }
 
-# Jesli film nie gra - klika w niego (srodek odtwarzacza). Do 3 prob: film z nieruchomym
-# obrazkiem wyglada jak "nie gra", wiec pierwszy klik moze go zatrzymac - drugi wznowi.
-function Wlacz-Film([double]$cx, [double]$cy, [int]$sx, [int]$sy, [int]$sw, [int]$sh) {
-    for ($proba = 1; $proba -le 3; $proba++) {
-        if (Czy-Gra $sx $sy $sw $sh) { Write-Host '    - film gra'; return }
-        Write-Host '    - film nie gra - klikam w niego'
-        Mysz-Do $cx $cy
-        Kliknij
-        Czekaj 1000
-    }
-}
 
 # Pilnuje, zeby na wierzchu byla przegladarka (zwraca jej okno)
 function Aktywuj-Przegladarke {
@@ -417,7 +653,6 @@ function Znajdz-Film([string]$fraza) {
 
 # ------------------------------ START --------------------------------
 
-[void][Bot.W]::SetProcessDPIAware()     # dokladne wspolrzedne przy skalowaniu ekranu
 [void][Bot.W]::GetAsyncKeyState(0x2E)   # wyzeruj stan klawisza DELETE
 
 # Przegladarka: Chrome, a jesli go nie ma - Edge (jest w kazdym Windowsie)
@@ -501,9 +736,8 @@ for ($i = 0; $i -lt $Piosenki.Count; $i++) {
     $sw = [int](200 * $skala)
     $sh = [int](120 * $skala)
 
-    # czekaj, az film sam ruszy (mierzy czas wczytywania), a jak nie - kliknij w niego
+    # czekaj, az film sam ruszy (mierzy czas wczytywania)
     Czekaj-Na-Film $sx $sy $sw $sh
-    Wlacz-Film $cx $cy $sx $sy $sw $sh
 
     # kolko myszka nad filmem
     Mysz-Do ($cx + 80) $cy
@@ -520,5 +754,7 @@ for ($i = 0; $i -lt $Piosenki.Count; $i++) {
 }
 
 [Bot.Blokada]::Wylacz()                         # oddaj mysz i klawiature
+Zamknij-Pilke
+Zamknij-Obrazki
 Write-Host ''
 Write-Host '  Gotowe! Wszystkie piosenki leca. Mysz i klawiatura odblokowane.' -ForegroundColor Green
